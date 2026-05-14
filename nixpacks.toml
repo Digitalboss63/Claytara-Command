@@ -1,0 +1,14 @@
+[phases.install]
+cmds = ["npm ci"]
+
+[phases.install.variables]
+NODE_ENV = "development"
+
+[phases.build]
+cmds = ["npm run build"]
+
+[phases.build.variables]
+NODE_ENV = "development"
+
+[start]
+cmd = "NODE_ENV=production node dist/server.mjs"
