@@ -18,7 +18,7 @@ import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
 import { eq, desc } from "drizzle-orm";
-import { resolve, dirname } from "path";
+import { resolve } from "path";
 import { fileURLToPath } from "url";
 import db from "./db/index.js";
 import { runMigrations } from "./db/migrate.js";
@@ -27,7 +27,9 @@ import {
   insertProjectSchema, insertNoteSchema,
 } from "../shared/schema.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
+// Compute server directory from import.meta.url — avoids declaring __dirname
+// at module scope which clashes with bundled dependencies in ESM bundles.
+const _serverDir = resolve(fileURLToPath(import.meta.url), "..");
 const app = express();
 const PORT = parseInt(process.env.PORT || "5002", 10);
 const startedAt = Date.now();
@@ -255,7 +257,7 @@ app.get("/api/protocols", (_req, res) => {
 
 // ── Serve frontend in production ──────────────────────────────────────────────
 if (process.env.NODE_ENV === "production") {
-  const frontendPath = resolve(__dirname, ".");
+  const frontendPath = resolve(_serverDir, ".");
   app.use(express.static(frontendPath));
   app.get("/{*path}", (_req, res) => {
     res.sendFile(resolve(frontendPath, "index.html"));

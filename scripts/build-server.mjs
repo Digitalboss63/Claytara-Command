@@ -12,17 +12,11 @@ await build({
   target: "node20",
   format: "esm",
   outfile: resolve(root, "dist/server.mjs"),
-  banner: {
-    js: `
-import { createRequire } from 'module';
-import { fileURLToPath } from 'url';
-import { dirname } from 'path';
-const require = createRequire(import.meta.url);
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-    `.trim(),
-  },
-  external: ["postgres", "@neondatabase/serverless"],
+  // No banner — let esbuild inject __dirname/__filename shims via inject
+  // and use createRequire only for packages that need CJS require().
+  // Mark all node_modules as external — avoids CJS/ESM bundling conflicts
+  // with express, depd, and other CJS packages that use dynamic require().
+  packages: "external",
 });
 
 console.log("Server build complete → dist/server.mjs");
