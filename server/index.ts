@@ -236,6 +236,112 @@ app.post("/api/projects/:id/notes", async (req, res) => {
   }
 });
 
+// ── One-time seed endpoint ────────────────────────────────────────────────────
+// POST /api/admin/seed — seeds 6 projects + notes. Safe to call multiple times
+// (clears and re-seeds). Remove this route after first use.
+
+app.post("/api/admin/seed", async (_req, res) => {
+  try {
+    await db.delete(projectNotes);
+    await db.delete(systemHealthSnapshots);
+    await db.delete(projects);
+
+    const inserted = await db.insert(projects).values([
+      {
+        name: "The Vital Herbs",
+        description: "Herbal health resource platform targeting Black American, American Indian, and Caribbean communities. Recurring subscription model with AI herb advisor.",
+        status: "active", priority: "high", productionStage: "live",
+        domain: "thevitalherbs.com",
+        githubUrl: "https://github.com/Digitalboss63/green-thumb-coach",
+        railwayUrl: "https://www.thevitalherbs.com",
+        stripeConnected: true, clerkConnected: true, aiEnabled: true,
+        notes: "Voice Advisor Phase 2 live. 104 herbs in catalog. Retrieval-grounded, rate-limited, sanitizer active.",
+        blockers: null,
+        lastDeployedAt: new Date("2026-05-14"),
+      },
+      {
+        name: "Shopfu",
+        description: "AI-powered Shopify store builder. Solves ugly stores and limited niche/category support. Holiday AI feature included.",
+        status: "building", priority: "high", productionStage: "beta",
+        domain: null,
+        githubUrl: "https://github.com/Digitalboss63/Shopfu",
+        railwayUrl: null,
+        stripeConnected: false, clerkConnected: false, aiEnabled: true,
+        notes: "Core store builder functional. AI product categorization needs tuning.",
+        blockers: "Shopify API rate limits on bulk product import need mitigation strategy.",
+        lastDeployedAt: new Date("2026-04-11"),
+      },
+      {
+        name: "The Credit Signal Pro",
+        description: "Consumer credit intelligence machine. 4-tier subscription: Trial / Essential / All Access / Enterprise.",
+        status: "active", priority: "critical", productionStage: "live",
+        domain: "creditsignalpro.com",
+        githubUrl: "https://github.com/Digitalboss63/the-credit-sentinel",
+        railwayUrl: "https://web-production-28ae1.up.railway.app",
+        stripeConnected: true, clerkConnected: true, aiEnabled: true,
+        notes: "Rebrand complete. All 4 Stripe price IDs needed in Railway vars.",
+        blockers: "STRIPE_PRICE_ID_ESSENTIAL, STRIPE_PRICE_ID_ALL_ACCESS, STRIPE_PRICE_ID_ENTERPRISE not yet set.",
+        lastDeployedAt: new Date("2026-05-06"),
+      },
+      {
+        name: "LeadGen Foundry",
+        description: "AI website and lead generation system. Automated lead capture and nurturing pipeline.",
+        status: "building", priority: "medium", productionStage: "prototype",
+        domain: null, githubUrl: null, railwayUrl: null,
+        stripeConnected: false, clerkConnected: false, aiEnabled: true,
+        notes: "Architecture defined. Build not yet started.",
+        blockers: "Waiting on Shopfu completion before full focus.",
+        lastDeployedAt: null,
+      },
+      {
+        name: "Funds Finder AI",
+        description: "AI-powered grant and funding discovery platform.",
+        status: "paused", priority: "low", productionStage: "idea",
+        domain: null, githubUrl: null, railwayUrl: null,
+        stripeConnected: false, clerkConnected: false, aiEnabled: true,
+        notes: "Concept validated. On backlog pending bandwidth.",
+        blockers: null, lastDeployedAt: null,
+      },
+      {
+        name: "BOARDS OS",
+        description: "Operational board management system. Project and task visibility layer.",
+        status: "paused", priority: "low", productionStage: "idea",
+        domain: null, githubUrl: null, railwayUrl: null,
+        stripeConnected: false, clerkConnected: false, aiEnabled: false,
+        notes: "Concept stage. Claytara Command may supersede this.",
+        blockers: null, lastDeployedAt: null,
+      },
+    ]).returning();
+
+    const vitalHerbs   = inserted.find(p => p.name === "The Vital Herbs")!;
+    const creditSignal = inserted.find(p => p.name === "The Credit Signal Pro")!;
+    const shopfu       = inserted.find(p => p.name === "Shopfu")!;
+
+    await db.insert(projectNotes).values([
+      { projectId: vitalHerbs.id, title: "Voice Advisor Phase 2 Live", note: "Retrieval-grounded voice advisor deployed. VOICE_ADVISOR_ENABLED=true in Railway. All 9 verification tests passed.", severity: "info" },
+      { projectId: vitalHerbs.id, title: "APP_URL env var missing", note: "Railway health shows missing: APP_URL. Set APP_URL=https://www.thevitalherbs.com in Railway Variables.", severity: "warning" },
+      { projectId: creditSignal.id, title: "Stripe Price IDs Missing", note: "STRIPE_PRICE_ID_ESSENTIAL, STRIPE_PRICE_ID_ALL_ACCESS, STRIPE_PRICE_ID_ENTERPRISE not set. Subscription checkout will fail.", severity: "blocker" },
+      { projectId: creditSignal.id, title: "Rebrand Complete", note: "Full rebrand from Credit Sentinel complete. creditsignalpro.com registered.", severity: "info" },
+      { projectId: shopfu.id, title: "API Rate Limit Risk", note: "Shopify bulk import hits limits above ~50 products/min. Need exponential backoff before launch.", severity: "warning" },
+    ]);
+
+    await db.insert(systemHealthSnapshots).values([
+      { service: "railway", status: "unknown", statusText: "Not yet checked" },
+      { service: "stripe",  status: "unknown", statusText: "Not yet checked" },
+      { service: "clerk",   status: "unknown", statusText: "Not yet checked" },
+      { service: "github",  status: "unknown", statusText: "Not yet checked" },
+      { service: "ai",      status: "unknown", statusText: "Not yet checked" },
+      { service: "domains", status: "unknown", statusText: "Not yet checked" },
+    ]);
+
+    process.stdout.write(`[seed] Seeded ${inserted.length} projects\n`);
+    res.json({ ok: true, projects: inserted.length, message: "Seeded successfully." });
+  } catch (err) {
+    process.stderr.write(`[seed] Error: ${safeError(err)}\n`);
+    res.status(500).json({ error: "Seed failed", detail: safeError(err) });
+  }
+});
+
 // ── AI Readiness Placeholders (Phase 2) ───────────────────────────────────────
 // Pre-wired endpoints — not implemented yet. Return 501 clearly.
 
