@@ -1,7 +1,7 @@
 /**
- * server/db/migrate.ts — Inline migration runner
- * Each statement executed individually — postgres.js does not support
- * multi-statement strings in a single db.execute() call.
+ * server/db/migrate.ts — Inline migration runner (idempotent)
+ * Phase 2: adds health fields + nextAction to projects, adds protocols table.
+ * Each statement executed individually — postgres.js rejects multi-statement strings.
  */
 
 import db from "./index.js";
@@ -10,39 +10,23 @@ import { sql } from "drizzle-orm";
 export async function runMigrations(): Promise<void> {
   process.stdout.write("[db] Running migrations...\n");
 
-  // ── Enums — use DO block to create only if missing (IF NOT EXISTS not
-  // supported for types in all PG versions via simple CREATE TYPE syntax)
-  await db.execute(sql`
-    DO $$ BEGIN
-      CREATE TYPE project_status AS ENUM ('active','building','paused','archived');
-    EXCEPTION WHEN duplicate_object THEN NULL; END $$
-  `);
+  // ── Enums ─────────────────────────────────────────────────────────────────
+  for (const [name, values] of [
+    ["project_status",    "'active','building','paused','archived'"],
+    ["production_stage",  "'idea','prototype','beta','live','scaling'"],
+    ["priority",          "'critical','high','medium','low'"],
+    ["note_severity",     "'info','warning','critical','blocker'"],
+    ["health_status",     "'healthy','warning','critical','unknown'"],
+    ["protocol_priority", "'mandatory','recommended','optional'"],
+  ] as [string, string][]) {
+    await db.execute(sql.raw(`
+      DO $$ BEGIN
+        CREATE TYPE ${name} AS ENUM (${values});
+      EXCEPTION WHEN duplicate_object THEN NULL; END $$
+    `));
+  }
 
-  await db.execute(sql`
-    DO $$ BEGIN
-      CREATE TYPE production_stage AS ENUM ('idea','prototype','beta','live','scaling');
-    EXCEPTION WHEN duplicate_object THEN NULL; END $$
-  `);
-
-  await db.execute(sql`
-    DO $$ BEGIN
-      CREATE TYPE priority AS ENUM ('critical','high','medium','low');
-    EXCEPTION WHEN duplicate_object THEN NULL; END $$
-  `);
-
-  await db.execute(sql`
-    DO $$ BEGIN
-      CREATE TYPE note_severity AS ENUM ('info','warning','critical','blocker');
-    EXCEPTION WHEN duplicate_object THEN NULL; END $$
-  `);
-
-  await db.execute(sql`
-    DO $$ BEGIN
-      CREATE TYPE health_status AS ENUM ('healthy','warning','critical','unknown');
-    EXCEPTION WHEN duplicate_object THEN NULL; END $$
-  `);
-
-  // ── Tables
+  // ── Core tables ────────────────────────────────────────────────────────────
   await db.execute(sql`
     CREATE TABLE IF NOT EXISTS projects (
       id                SERIAL PRIMARY KEY,
@@ -85,6 +69,39 @@ export async function runMigrations(): Promise<void> {
       checked_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       response_ms  INTEGER,
       metadata     TEXT
+    )
+  `);
+
+  // ── Phase 2: safe ALTER TABLE for new columns ──────────────────────────────
+  const projectAlters: [string, string][] = [
+    ["health_endpoint_url",          "TEXT"],
+    ["last_health_status",           "health_status DEFAULT 'unknown'"],
+    ["last_health_checked_at",       "TIMESTAMPTZ"],
+    ["last_health_response_summary", "TEXT"],
+    ["last_health_error",            "TEXT"],
+    ["next_action",                  "TEXT"],
+  ];
+
+  for (const [col, def] of projectAlters) {
+    await db.execute(sql.raw(`
+      DO $$ BEGIN
+        ALTER TABLE projects ADD COLUMN ${col} ${def};
+      EXCEPTION WHEN duplicate_column THEN NULL; END $$
+    `));
+  }
+
+  // ── Protocols table ────────────────────────────────────────────────────────
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS protocols (
+      id            SERIAL PRIMARY KEY,
+      title         TEXT NOT NULL,
+      category      TEXT NOT NULL,
+      description   TEXT,
+      protocol_text TEXT NOT NULL,
+      priority      protocol_priority NOT NULL DEFAULT 'recommended',
+      active        BOOLEAN NOT NULL DEFAULT true,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `);
 

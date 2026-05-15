@@ -1,17 +1,16 @@
 /**
- * server/index.ts — Claytara Command API Server
+ * server/index.ts — Claytara Command API Server (Phase 2)
  *
- * Routes:
- *   GET  /api/health/full
- *   GET  /api/projects
- *   GET  /api/projects/:id
- *   POST /api/projects
- *   PUT  /api/projects/:id
- *   GET  /api/projects/:id/notes
- *   POST /api/projects/:id/notes
- *   GET  /api/health/services
+ * New in Phase 2:
+ *   GET  /api/projects/:id/check-health
+ *   POST /api/projects/check-all-health
+ *   GET  /api/protocols
+ *   GET  /api/protocols/:id
+ *   POST /api/protocols
+ *   PUT  /api/protocols/:id
  *
- * AI readiness: placeholder routes pre-wired for Phase 2 expansion.
+ *   Projects now include: healthEndpointUrl, lastHealthStatus,
+ *   lastHealthCheckedAt, lastHealthResponseSummary, lastHealthError, nextAction
  */
 
 import express from "express";
@@ -23,12 +22,10 @@ import { fileURLToPath } from "url";
 import db from "./db/index.js";
 import { runMigrations } from "./db/migrate.js";
 import {
-  projects, projectNotes, systemHealthSnapshots,
-  insertProjectSchema, insertNoteSchema,
+  projects, projectNotes, systemHealthSnapshots, protocols,
+  insertProjectSchema, insertNoteSchema, insertProtocolSchema,
 } from "../shared/schema.js";
 
-// Compute server directory from import.meta.url — avoids declaring __dirname
-// at module scope which clashes with bundled dependencies in ESM bundles.
 const _serverDir = resolve(fileURLToPath(import.meta.url), "..");
 const app = express();
 const PORT = parseInt(process.env.PORT || "5002", 10);
@@ -62,10 +59,9 @@ const apiLimiter = rateLimit({
 });
 app.use("/api", apiLimiter);
 
-// ── Global error sanitizer ───────────────────────────────────────────────────
+// ── Sanitizer ─────────────────────────────────────────────────────────────────
 function safeError(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
-  // Strip connection strings, keys, anything secret-shaped
   return msg
     .replace(/postgresql:\/\/[^\s"]*/gi, "[DB_URL]")
     .replace(/sk-[a-zA-Z0-9-]{20,}/g, "[API_KEY]")
@@ -78,6 +74,53 @@ function envOk(): boolean {
   return REQUIRED_ENV.some((k) => !!process.env[k]);
 }
 
+// ── Health endpoint checker ───────────────────────────────────────────────────
+interface HealthCheckResult {
+  status: "healthy" | "warning" | "critical" | "unknown";
+  summary: string;
+  error: string | null;
+  responseMs: number;
+}
+
+async function checkProjectHealth(url: string): Promise<HealthCheckResult> {
+  const start = Date.now();
+  try {
+    // Strict: only allow https URLs, cap timeout at 8s
+    if (!url.startsWith("https://") && !url.startsWith("http://localhost")) {
+      return { status: "unknown", summary: "Invalid endpoint URL", error: "Only https:// allowed", responseMs: 0 };
+    }
+    const res = await fetch(url, {
+      signal: AbortSignal.timeout(8000),
+      headers: { "User-Agent": "ClaytaraCommand/2.0 health-checker" },
+    });
+    const ms = Date.now() - start;
+    if (!res.ok) {
+      return { status: "critical", summary: `HTTP ${res.status}`, error: `HTTP ${res.status} ${res.statusText}`, responseMs: ms };
+    }
+    const data = await res.json().catch(() => ({})) as Record<string, unknown>;
+    // Interpret status field if present
+    const s = String(data.status ?? "").toLowerCase();
+    const status: HealthCheckResult["status"] =
+      s === "ok" || s === "healthy" ? "healthy"
+      : s === "degraded" || s === "warning" ? "warning"
+      : s === "critical" ? "critical"
+      : res.ok ? "healthy"
+      : "critical";
+    const summary = JSON.stringify(data).slice(0, 300);
+    return { status, summary, error: null, responseMs: ms };
+  } catch (err) {
+    const ms = Date.now() - start;
+    const msg = err instanceof Error ? err.message : String(err);
+    const isTimed = msg.includes("timeout") || msg.includes("abort");
+    return {
+      status: "critical",
+      summary: isTimed ? "Request timed out" : "Connection failed",
+      error: isTimed ? "Timed out after 8s" : "Could not reach endpoint",
+      responseMs: ms,
+    };
+  }
+}
+
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 // GET /api/health/full
@@ -87,35 +130,23 @@ app.get("/api/health/full", async (_req, res) => {
     await db.execute(drizzleSql`SELECT 1`);
     dbOk = true;
   } catch { /* db down */ }
-
   const envValid = envOk();
-  const overall = dbOk && envValid ? "healthy" : "degraded";
-
   res.json({
-    status: overall,
-    server: true,
-    database: dbOk,
-    env: envValid,
+    status: dbOk && envValid ? "healthy" : "degraded",
+    server: true, database: dbOk, env: envValid,
     uptime: Math.floor((Date.now() - startedAt) / 1000),
     timestamp: new Date().toISOString(),
   });
 });
 
-// GET /api/health/services — latest snapshot per service
+// GET /api/health/services
 app.get("/api/health/services", async (_req, res) => {
   try {
-    const rows = await db
-      .select()
-      .from(systemHealthSnapshots)
-      .orderBy(desc(systemHealthSnapshots.checkedAt))
-      .limit(50);
-
-    // Latest per service
+    const rows = await db.select().from(systemHealthSnapshots).orderBy(desc(systemHealthSnapshots.checkedAt)).limit(50);
     const byService: Record<string, typeof rows[0]> = {};
     for (const row of rows) {
       if (!byService[row.service]) byService[row.service] = row;
     }
-
     res.json({ services: Object.values(byService) });
   } catch (err) {
     res.status(500).json({ error: "Failed to load service health" });
@@ -126,10 +157,7 @@ app.get("/api/health/services", async (_req, res) => {
 // GET /api/projects
 app.get("/api/projects", async (_req, res) => {
   try {
-    const rows = await db
-      .select()
-      .from(projects)
-      .orderBy(projects.priority, projects.name);
+    const rows = await db.select().from(projects).orderBy(projects.priority, projects.name);
     res.json({ projects: rows });
   } catch (err) {
     res.status(500).json({ error: "Failed to load projects" });
@@ -141,18 +169,10 @@ app.get("/api/projects", async (_req, res) => {
 app.get("/api/projects/:id", async (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (isNaN(id)) { res.status(400).json({ error: "Invalid project ID" }); return; }
-
   try {
     const [project] = await db.select().from(projects).where(eq(projects.id, id));
     if (!project) { res.status(404).json({ error: "Project not found" }); return; }
-
-    const notes = await db
-      .select()
-      .from(projectNotes)
-      .where(eq(projectNotes.projectId, id))
-      .orderBy(desc(projectNotes.createdAt))
-      .limit(20);
-
+    const notes = await db.select().from(projectNotes).where(eq(projectNotes.projectId, id)).orderBy(desc(projectNotes.createdAt)).limit(20);
     res.json({ project, notes });
   } catch (err) {
     res.status(500).json({ error: "Failed to load project" });
@@ -163,10 +183,7 @@ app.get("/api/projects/:id", async (req, res) => {
 // POST /api/projects
 app.post("/api/projects", async (req, res) => {
   const parsed = insertProjectSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: "Invalid project data", issues: parsed.error.issues });
-    return;
-  }
+  if (!parsed.success) { res.status(400).json({ error: "Invalid project data", issues: parsed.error.issues }); return; }
   try {
     const [created] = await db.insert(projects).values(parsed.data).returning();
     res.status(201).json({ project: created });
@@ -180,18 +197,10 @@ app.post("/api/projects", async (req, res) => {
 app.put("/api/projects/:id", async (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (isNaN(id)) { res.status(400).json({ error: "Invalid project ID" }); return; }
-
   const parsed = insertProjectSchema.partial().safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: "Invalid project data", issues: parsed.error.issues });
-    return;
-  }
+  if (!parsed.success) { res.status(400).json({ error: "Invalid project data", issues: parsed.error.issues }); return; }
   try {
-    const [updated] = await db
-      .update(projects)
-      .set({ ...parsed.data, updatedAt: new Date() })
-      .where(eq(projects.id, id))
-      .returning();
+    const [updated] = await db.update(projects).set({ ...parsed.data, updatedAt: new Date() }).where(eq(projects.id, id)).returning();
     if (!updated) { res.status(404).json({ error: "Project not found" }); return; }
     res.json({ project: updated });
   } catch (err) {
@@ -200,16 +209,72 @@ app.put("/api/projects/:id", async (req, res) => {
   }
 });
 
+// GET /api/projects/:id/check-health
+app.get("/api/projects/:id/check-health", async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (isNaN(id)) { res.status(400).json({ error: "Invalid project ID" }); return; }
+  try {
+    const [project] = await db.select().from(projects).where(eq(projects.id, id));
+    if (!project) { res.status(404).json({ error: "Project not found" }); return; }
+    if (!project.healthEndpointUrl) {
+      res.json({ status: "unknown", message: "No health endpoint configured for this project." });
+      return;
+    }
+    const result = await checkProjectHealth(project.healthEndpointUrl);
+    await db.update(projects).set({
+      lastHealthStatus: result.status,
+      lastHealthCheckedAt: new Date(),
+      lastHealthResponseSummary: result.summary,
+      lastHealthError: result.error,
+      updatedAt: new Date(),
+    }).where(eq(projects.id, id));
+    process.stdout.write(`[health-check] project=${id} status=${result.status} ms=${result.responseMs}\n`);
+    res.json({ ...result, checkedAt: new Date().toISOString() });
+  } catch (err) {
+    res.status(500).json({ error: "Health check failed" });
+    process.stderr.write(`[health-check] error: ${safeError(err)}\n`);
+  }
+});
+
+// POST /api/projects/check-all-health
+app.post("/api/projects/check-all-health", async (_req, res) => {
+  try {
+    const allProjects = await db.select().from(projects);
+    const withEndpoints = allProjects.filter(p => !!p.healthEndpointUrl);
+    if (withEndpoints.length === 0) {
+      res.json({ checked: 0, results: [], message: "No projects have health endpoints configured." });
+      return;
+    }
+    const results = await Promise.allSettled(
+      withEndpoints.map(async (p) => {
+        const result = await checkProjectHealth(p.healthEndpointUrl!);
+        await db.update(projects).set({
+          lastHealthStatus: result.status,
+          lastHealthCheckedAt: new Date(),
+          lastHealthResponseSummary: result.summary,
+          lastHealthError: result.error,
+          updatedAt: new Date(),
+        }).where(eq(projects.id, p.id));
+        return { id: p.id, name: p.name, ...result };
+      })
+    );
+    const summary = results.map(r =>
+      r.status === "fulfilled" ? r.value : { id: 0, name: "unknown", status: "critical", error: "Check failed" }
+    );
+    process.stdout.write(`[health-check] checked ${summary.length} projects\n`);
+    res.json({ checked: summary.length, results: summary });
+  } catch (err) {
+    res.status(500).json({ error: "Bulk health check failed" });
+    process.stderr.write(`[health-check] bulk error: ${safeError(err)}\n`);
+  }
+});
+
 // GET /api/projects/:id/notes
 app.get("/api/projects/:id/notes", async (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (isNaN(id)) { res.status(400).json({ error: "Invalid project ID" }); return; }
   try {
-    const notes = await db
-      .select()
-      .from(projectNotes)
-      .where(eq(projectNotes.projectId, id))
-      .orderBy(desc(projectNotes.createdAt));
+    const notes = await db.select().from(projectNotes).where(eq(projectNotes.projectId, id)).orderBy(desc(projectNotes.createdAt));
     res.json({ notes });
   } catch (err) {
     res.status(500).json({ error: "Failed to load notes" });
@@ -221,12 +286,8 @@ app.get("/api/projects/:id/notes", async (req, res) => {
 app.post("/api/projects/:id/notes", async (req, res) => {
   const id = parseInt(req.params.id, 10);
   if (isNaN(id)) { res.status(400).json({ error: "Invalid project ID" }); return; }
-
   const parsed = insertNoteSchema.safeParse({ ...req.body, projectId: id });
-  if (!parsed.success) {
-    res.status(400).json({ error: "Invalid note data", issues: parsed.error.issues });
-    return;
-  }
+  if (!parsed.success) { res.status(400).json({ error: "Invalid note data", issues: parsed.error.issues }); return; }
   try {
     const [note] = await db.insert(projectNotes).values(parsed.data).returning();
     res.status(201).json({ note });
@@ -236,137 +297,73 @@ app.post("/api/projects/:id/notes", async (req, res) => {
   }
 });
 
-// ── Seed endpoint removed after first use ────────────────────────────────────
-// Was: POST /api/admin/seed — data is now live in DB.
+// ── Protocols ─────────────────────────────────────────────────────────────────
 
-if (false) app.post("/api/admin/seed", async (_req, res) => {
+// GET /api/protocols
+app.get("/api/protocols", async (_req, res) => {
   try {
-    await db.delete(projectNotes);
-    await db.delete(systemHealthSnapshots);
-    await db.delete(projects);
-
-    const inserted = await db.insert(projects).values([
-      {
-        name: "The Vital Herbs",
-        description: "Herbal health resource platform targeting Black American, American Indian, and Caribbean communities. Recurring subscription model with AI herb advisor.",
-        status: "active", priority: "high", productionStage: "live",
-        domain: "thevitalherbs.com",
-        githubUrl: "https://github.com/Digitalboss63/green-thumb-coach",
-        railwayUrl: "https://www.thevitalherbs.com",
-        stripeConnected: true, clerkConnected: true, aiEnabled: true,
-        notes: "Voice Advisor Phase 2 live. 104 herbs in catalog. Retrieval-grounded, rate-limited, sanitizer active.",
-        blockers: null,
-        lastDeployedAt: new Date("2026-05-14"),
-      },
-      {
-        name: "Shopfu",
-        description: "AI-powered Shopify store builder. Solves ugly stores and limited niche/category support. Holiday AI feature included.",
-        status: "building", priority: "high", productionStage: "beta",
-        domain: null,
-        githubUrl: "https://github.com/Digitalboss63/Shopfu",
-        railwayUrl: null,
-        stripeConnected: false, clerkConnected: false, aiEnabled: true,
-        notes: "Core store builder functional. AI product categorization needs tuning.",
-        blockers: "Shopify API rate limits on bulk product import need mitigation strategy.",
-        lastDeployedAt: new Date("2026-04-11"),
-      },
-      {
-        name: "The Credit Signal Pro",
-        description: "Consumer credit intelligence machine. 4-tier subscription: Trial / Essential / All Access / Enterprise.",
-        status: "active", priority: "critical", productionStage: "live",
-        domain: "creditsignalpro.com",
-        githubUrl: "https://github.com/Digitalboss63/the-credit-sentinel",
-        railwayUrl: "https://web-production-28ae1.up.railway.app",
-        stripeConnected: true, clerkConnected: true, aiEnabled: true,
-        notes: "Rebrand complete. All 4 Stripe price IDs needed in Railway vars.",
-        blockers: "STRIPE_PRICE_ID_ESSENTIAL, STRIPE_PRICE_ID_ALL_ACCESS, STRIPE_PRICE_ID_ENTERPRISE not yet set.",
-        lastDeployedAt: new Date("2026-05-06"),
-      },
-      {
-        name: "LeadGen Foundry",
-        description: "AI website and lead generation system. Automated lead capture and nurturing pipeline.",
-        status: "building", priority: "medium", productionStage: "prototype",
-        domain: null, githubUrl: null, railwayUrl: null,
-        stripeConnected: false, clerkConnected: false, aiEnabled: true,
-        notes: "Architecture defined. Build not yet started.",
-        blockers: "Waiting on Shopfu completion before full focus.",
-        lastDeployedAt: null,
-      },
-      {
-        name: "Funds Finder AI",
-        description: "AI-powered grant and funding discovery platform.",
-        status: "paused", priority: "low", productionStage: "idea",
-        domain: null, githubUrl: null, railwayUrl: null,
-        stripeConnected: false, clerkConnected: false, aiEnabled: true,
-        notes: "Concept validated. On backlog pending bandwidth.",
-        blockers: null, lastDeployedAt: null,
-      },
-      {
-        name: "BOARDS OS",
-        description: "Operational board management system. Project and task visibility layer.",
-        status: "paused", priority: "low", productionStage: "idea",
-        domain: null, githubUrl: null, railwayUrl: null,
-        stripeConnected: false, clerkConnected: false, aiEnabled: false,
-        notes: "Concept stage. Claytara Command may supersede this.",
-        blockers: null, lastDeployedAt: null,
-      },
-    ]).returning();
-
-    const vitalHerbs   = inserted.find(p => p.name === "The Vital Herbs")!;
-    const creditSignal = inserted.find(p => p.name === "The Credit Signal Pro")!;
-    const shopfu       = inserted.find(p => p.name === "Shopfu")!;
-
-    await db.insert(projectNotes).values([
-      { projectId: vitalHerbs.id, title: "Voice Advisor Phase 2 Live", note: "Retrieval-grounded voice advisor deployed. VOICE_ADVISOR_ENABLED=true in Railway. All 9 verification tests passed.", severity: "info" },
-      { projectId: vitalHerbs.id, title: "APP_URL env var missing", note: "Railway health shows missing: APP_URL. Set APP_URL=https://www.thevitalherbs.com in Railway Variables.", severity: "warning" },
-      { projectId: creditSignal.id, title: "Stripe Price IDs Missing", note: "STRIPE_PRICE_ID_ESSENTIAL, STRIPE_PRICE_ID_ALL_ACCESS, STRIPE_PRICE_ID_ENTERPRISE not set. Subscription checkout will fail.", severity: "blocker" },
-      { projectId: creditSignal.id, title: "Rebrand Complete", note: "Full rebrand from Credit Sentinel complete. creditsignalpro.com registered.", severity: "info" },
-      { projectId: shopfu.id, title: "API Rate Limit Risk", note: "Shopify bulk import hits limits above ~50 products/min. Need exponential backoff before launch.", severity: "warning" },
-    ]);
-
-    await db.insert(systemHealthSnapshots).values([
-      { service: "railway", status: "unknown", statusText: "Not yet checked" },
-      { service: "stripe",  status: "unknown", statusText: "Not yet checked" },
-      { service: "clerk",   status: "unknown", statusText: "Not yet checked" },
-      { service: "github",  status: "unknown", statusText: "Not yet checked" },
-      { service: "ai",      status: "unknown", statusText: "Not yet checked" },
-      { service: "domains", status: "unknown", statusText: "Not yet checked" },
-    ]);
-
-    process.stdout.write(`[seed] Seeded ${inserted.length} projects\n`);
-    res.json({ ok: true, projects: inserted.length, message: "Seeded successfully." });
+    const rows = await db.select().from(protocols).orderBy(protocols.priority, protocols.category, protocols.title);
+    res.json({ protocols: rows });
   } catch (err) {
-    process.stderr.write(`[seed] Error: ${safeError(err)}\n`);
-    res.status(500).json({ error: "Seed failed", detail: safeError(err) });
+    res.status(500).json({ error: "Failed to load protocols" });
+    process.stderr.write(`[protocols] list error: ${safeError(err)}\n`);
   }
 });
 
-// ── AI Readiness Placeholders (Phase 2) ───────────────────────────────────────
-// Pre-wired endpoints — not implemented yet. Return 501 clearly.
-
-app.get("/api/ai/agents", (_req, res) => {
-  res.status(501).json({ message: "AI agents — Phase 2. Not yet implemented.", ready: false });
+// GET /api/protocols/:id
+app.get("/api/protocols/:id", async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (isNaN(id)) { res.status(400).json({ error: "Invalid protocol ID" }); return; }
+  try {
+    const [protocol] = await db.select().from(protocols).where(eq(protocols.id, id));
+    if (!protocol) { res.status(404).json({ error: "Protocol not found" }); return; }
+    res.json({ protocol });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to load protocol" });
+    process.stderr.write(`[protocols] get error: ${safeError(err)}\n`);
+  }
 });
 
-app.get("/api/ai/retrieval/status", (_req, res) => {
-  res.status(501).json({ message: "Retrieval system — Phase 2. Not yet implemented.", ready: false });
+// POST /api/protocols
+app.post("/api/protocols", async (req, res) => {
+  const parsed = insertProtocolSchema.safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: "Invalid protocol data", issues: parsed.error.issues }); return; }
+  try {
+    const [created] = await db.insert(protocols).values(parsed.data).returning();
+    res.status(201).json({ protocol: created });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to create protocol" });
+    process.stderr.write(`[protocols] create error: ${safeError(err)}\n`);
+  }
 });
 
-app.get("/api/ai/self-heal/status", (_req, res) => {
-  res.status(501).json({ message: "Self-heal system — Phase 2. Not yet implemented.", ready: false });
+// PUT /api/protocols/:id
+app.put("/api/protocols/:id", async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (isNaN(id)) { res.status(400).json({ error: "Invalid protocol ID" }); return; }
+  const parsed = insertProtocolSchema.partial().safeParse(req.body);
+  if (!parsed.success) { res.status(400).json({ error: "Invalid protocol data", issues: parsed.error.issues }); return; }
+  try {
+    const [updated] = await db.update(protocols).set({ ...parsed.data, updatedAt: new Date() }).where(eq(protocols.id, id)).returning();
+    if (!updated) { res.status(404).json({ error: "Protocol not found" }); return; }
+    res.json({ protocol: updated });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to update protocol" });
+    process.stderr.write(`[protocols] update error: ${safeError(err)}\n`);
+  }
 });
 
-app.get("/api/protocols", (_req, res) => {
-  res.status(501).json({ message: "Protocol engine — Phase 2. Not yet implemented.", ready: false });
-});
+// ── AI Readiness Placeholders ─────────────────────────────────────────────────
+app.get("/api/ai/agents",          (_req, res) => { res.status(501).json({ message: "AI agents — Phase 3.", ready: false }); });
+app.get("/api/ai/retrieval/status",(_req, res) => { res.status(501).json({ message: "Retrieval system — Phase 3.", ready: false }); });
+app.get("/api/ai/self-heal/status",(_req, res) => { res.status(501).json({ message: "Self-heal — Phase 3.", ready: false }); });
+app.get("/api/protocols-engine",   (_req, res) => { res.status(501).json({ message: "Protocol engine — Phase 3.", ready: false }); });
 
-// ── Serve frontend in production ──────────────────────────────────────────────
+// ── Serve frontend ────────────────────────────────────────────────────────────
 if (process.env.NODE_ENV === "production") {
   const frontendPath = resolve(_serverDir, ".");
   app.use(express.static(frontendPath));
-  app.get("/{*path}", (_req, res) => {
-    res.sendFile(resolve(frontendPath, "index.html"));
-  });
+  app.get("/{*path}", (_req, res) => { res.sendFile(resolve(frontendPath, "index.html")); });
 }
 
 // ── Global error handler ──────────────────────────────────────────────────────
@@ -375,13 +372,248 @@ app.use((err: Error, _req: express.Request, res: express.Response, _next: expres
   res.status(500).json({ error: "Internal server error" });
 });
 
+// ── Protocol seeder — runs once if protocols table is empty ───────────────────
+async function seedProtocolsIfEmpty(): Promise<void> {
+  const existing = await db.select().from(protocols).limit(1);
+  if (existing.length > 0) return;
+
+  process.stdout.write("[protocols] Seeding default protocols...\n");
+  await db.insert(protocols).values([
+    {
+      title: "MASTER-BUILD-PROCESS",
+      category: "Build & Deploy",
+      description: "End-to-end build protocol for all Claytara projects. Mandatory before any build starts.",
+      priority: "mandatory",
+      active: true,
+      protocolText: `# MASTER BUILD PROCESS
+
+## Phases
+PHASE 0 — Pre-Flight: Gather secrets, define env vars, confirm model access, create PHASE-0-handoff.md
+PHASE 1 — Foundation: Repo structure, DB schema, core routes, health endpoint
+PHASE 2 — Features: Business logic, UI, integrations
+PHASE 3 — AI Layer: Recommendation engine, self-heal, advisor
+PHASE 4 — Deploy: Railway deploy, env vars, verify /api/health/full
+PHASE 5 — Live Verification: Full test suite, Go/No-Go sign-off
+
+## Rules
+- Every phase produces a handoff doc in /handoff/
+- Never skip phases
+- /api/health/full must pass before Go
+- Security scan on every build before ship
+- Never expose err.message in API responses`,
+    },
+    {
+      title: "Grandma Easy UX Protocol",
+      category: "UX Design",
+      description: "UX standards ensuring maximum accessibility and minimal cognitive load.",
+      priority: "mandatory",
+      active: true,
+      protocolText: `# GRANDMA EASY UX PROTOCOL
+
+## Core Rules
+- Max 3-5 steps per workflow
+- One decision per screen
+- Visual-first — icons before words
+- Always show progress
+- "Order a result" model — user picks, system delivers
+
+## Button Rules
+- Primary action always biggest and clearest
+- Destructive actions require confirmation
+- No more than 3 actions visible at once
+
+## Copy Rules
+- Plain language — 8th grade reading level
+- No jargon, no acronyms without definition
+- Error messages explain what to do next, not just what failed
+
+## Mobile Rules
+- Touch targets minimum 44x44px
+- No hover-only interactions
+- Test on actual phone, not just browser resize`,
+    },
+    {
+      title: "Change Report Protocol",
+      category: "Documentation",
+      description: "Mandatory change report format for all builds and deployments.",
+      priority: "mandatory",
+      active: true,
+      protocolText: `# CHANGE REPORT PROTOCOL
+
+## Required for every build/deploy
+
+### Format
+- Files created/modified
+- Routes/endpoints added or changed
+- DB schema changes
+- Env vars required (new or changed)
+- Verification steps performed
+- Known TODOs
+- Deployment notes
+
+## Rules
+- Change report written BEFORE marking work complete
+- Every agent, every session, every phase
+- No "I'll do it later" — write it now`,
+    },
+    {
+      title: "Railway Deployment Protocol",
+      category: "Build & Deploy",
+      description: "Step-by-step Railway deployment process for all Claytara apps.",
+      priority: "mandatory",
+      active: true,
+      protocolText: `# RAILWAY DEPLOYMENT PROTOCOL
+
+## Pre-Deploy Checklist
+- nixpacks.toml in root with NODE_ENV=development for install + build phases
+- packages:"external" in esbuild config (avoids CJS/ESM bundling conflicts)
+- APPNAME_DATABASE_URL env var (never raw DATABASE_URL)
+- All required env vars staged in Railway Variables
+- /api/health/full implemented and returning correct shape
+
+## Deploy Steps
+1. Push to GitHub main branch
+2. Railway auto-deploys from GitHub
+3. Watch logs for: migrations complete, server running
+4. Hit /api/health/full — must return status: healthy
+5. Run functional smoke tests
+6. Write PHASE-N-handoff.md
+
+## Common Failures
+- Blank page: VITE_* env var missing at build time
+- Boot crash: __dirname declared at module scope (use import.meta.url)
+- DB error: wrong env var name or SSL not configured
+- 500 on all routes: getAuth() called without Clerk middleware`,
+    },
+    {
+      title: "Security Hardening Protocol",
+      category: "Security",
+      description: "Non-negotiable security requirements for all production deployments.",
+      priority: "mandatory",
+      active: true,
+      protocolText: `# SECURITY HARDENING PROTOCOL
+
+## API Rules
+- NEVER return err.message in API responses — generic message to client, full error to logger only
+- NEVER expose stack traces in responses
+- NEVER log API keys, passwords, connection strings
+- Rate limiting on all public endpoints
+- Input validation with Zod before any DB operation
+- Sanitize all error messages before logging
+
+## Auth Rules
+- No hardcoded credentials anywhere in code
+- All secrets in env vars only
+- Admin endpoints require token auth minimum
+
+## Pre-Ship Security Scan
+Pattern to grep before every deploy:
+- res.json({ error: err.message }) — FORBIDDEN
+- console.log with any secret-shaped value
+- Hardcoded sk_, pk_, whsec_, postgresql:// strings`,
+    },
+    {
+      title: "Self-Heal Protocol",
+      category: "Operations",
+      description: "Architecture pattern for self-healing systems. Applied to Vital Herbs.",
+      priority: "recommended",
+      active: true,
+      protocolText: `# SELF-HEAL PROTOCOL
+
+## Concept
+System monitors itself and surfaces actionable issues without human polling.
+
+## Detection Patterns
+- Missing env vars → surface in /api/health/full
+- DB schema drift → compare inline SQL against Drizzle schema
+- AI provider errors → log + surface in health, don't crash
+- Stripe webhook failures → log event + alert
+
+## Self-Heal Rules
+- Never auto-fix destructive operations (drops, deletes)
+- Surface issues clearly — specific, actionable error messages
+- Non-fatal degradation: server runs, features degrade gracefully
+- Fatal only on: missing DB URL, port bind failure
+
+## Health Endpoint Standard
+GET /api/health/full must return:
+{ status, server, database, env, uptime, timestamp }
+status: "healthy" | "degraded" | "critical"`,
+    },
+    {
+      title: "AI Voice/Advisor Protocol",
+      category: "AI Systems",
+      description: "Standards for AI advisor features. Based on Vital Herbs Voice Advisor build.",
+      priority: "recommended",
+      active: true,
+      protocolText: `# AI VOICE/ADVISOR PROTOCOL
+
+## Grounding Rules
+- AI MUST answer only from supplied catalog context
+- Retrieval runs BEFORE AI call — inject only retrieved records
+- LOW retrieval confidence → skip AI, return clarification prompt
+- Never hallucinate herbs, compounds, or benefits
+
+## Safety Rules
+- Urgent symptoms (chest pain, stroke) → bypass AI, return emergency message
+- Sensitive conditions (pregnancy, cancer, diabetes, HIV) → professional referral prefix
+- NEVER say "will cure" — educational language only
+- NEVER provide specific dosages unless in approved catalog content
+- Every response ends: "For educational purposes only — not medical advice"
+
+## Post-Response Sanitizer
+Block outputs containing: cure/cures, guaranteed, replace your doctor,
+specific dosage patterns, clinically proven to cure/treat, FDA approved
+
+## Feature Flag
+VOICE_ADVISOR_ENABLED=true/false — default false
+Never go live without explicit flag set`,
+    },
+    {
+      title: "GitHub/Railway Export Protocol",
+      category: "Build & Deploy",
+      description: "How to export any project from local to GitHub and Railway.",
+      priority: "recommended",
+      active: true,
+      protocolText: `# GITHUB / RAILWAY EXPORT PROTOCOL
+
+## GitHub Steps
+1. Create repo at github.com/new (private, no init files)
+2. Local: git init && git add -A && git commit -m "initial"
+3. git remote add origin <url>
+4. git push -u origin main
+   (If rejected: --force only when GitHub created a README)
+
+## Railway Steps
+1. New Project → Deploy from GitHub repo
+2. Add Postgres plugin → copy DATABASE_URL
+3. Set APPNAME_DATABASE_URL (service-specific, not DATABASE_URL)
+4. Set NODE_ENV=production
+5. nixpacks.toml handles build automatically
+6. After deploy: verify /api/health/full
+
+## Windows Gotchas
+- PowerShell: curl is aliased to Invoke-WebRequest — use Invoke-RestMethod
+- safe.directory: git config --global --add safe.directory <path>
+- && not valid in PowerShell — use ; instead`,
+    },
+  ]);
+
+  process.stdout.write("[protocols] 8 protocols seeded.\n");
+}
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 async function start() {
   try {
     await runMigrations();
   } catch (e) {
     process.stderr.write(`[db] Migration failed: ${safeError(e)}\n`);
-    // Don't crash — server can still run in degraded mode
+  }
+
+  try {
+    await seedProtocolsIfEmpty();
+  } catch (e) {
+    process.stderr.write(`[protocols] Seed failed: ${safeError(e)}\n`);
   }
 
   app.listen(PORT, "0.0.0.0", () => {

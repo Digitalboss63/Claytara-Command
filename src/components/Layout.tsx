@@ -1,13 +1,14 @@
 import { Link, useLocation } from "wouter";
 import {
-  LayoutDashboard, FolderKanban, Activity, Settings, Zap, ChevronRight
+  LayoutDashboard, FolderKanban, Activity, Zap, ChevronRight, BookOpen,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const NAV = [
-  { href: "/",         label: "Dashboard",  icon: LayoutDashboard },
-  { href: "/projects", label: "Projects",   icon: FolderKanban },
-  { href: "/health",   label: "Health",     icon: Activity },
+  { href: "/",          label: "Dashboard",  icon: LayoutDashboard },
+  { href: "/projects",  label: "Projects",   icon: FolderKanban },
+  { href: "/health",    label: "Health",     icon: Activity },
+  { href: "/protocols", label: "Protocols",  icon: BookOpen },
 ];
 
 function NavItem({ href, label, Icon }: { href: string; label: string; Icon: typeof LayoutDashboard }) {

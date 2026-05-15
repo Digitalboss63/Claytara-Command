@@ -1,5 +1,8 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { fetchProjects, fetchProject, createProject, updateProject, createNote } from "@/lib/api";
+import {
+  fetchProjects, fetchProject, createProject, updateProject,
+  createNote, checkProjectHealth, checkAllHealth,
+} from "@/lib/api";
 import type { InsertProject, InsertProjectNote } from "../../shared/schema";
 
 export function useProjects() {
@@ -42,5 +45,21 @@ export function useCreateNote(projectId: number) {
   return useMutation({
     mutationFn: (data: Omit<InsertProjectNote, "projectId">) => createNote(projectId, data),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["project", projectId] }),
+  });
+}
+
+export function useCheckProjectHealth(id: number) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => checkProjectHealth(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["project", id] }),
+  });
+}
+
+export function useCheckAllHealth() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: checkAllHealth,
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["projects"] }),
   });
 }

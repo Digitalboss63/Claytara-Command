@@ -2,10 +2,12 @@ import { lazy, Suspense } from "react";
 import { Route, Switch } from "wouter";
 import { Layout } from "@/components/Layout";
 
-const DashboardPage    = lazy(() => import("@/pages/DashboardPage"));
-const ProjectsPage     = lazy(() => import("@/pages/ProjectsPage"));
-const ProjectDetailPage = lazy(() => import("@/pages/ProjectDetailPage"));
-const HealthPage       = lazy(() => import("@/pages/HealthPage"));
+const DashboardPage      = lazy(() => import("@/pages/DashboardPage"));
+const ProjectsPage       = lazy(() => import("@/pages/ProjectsPage"));
+const ProjectDetailPage  = lazy(() => import("@/pages/ProjectDetailPage"));
+const HealthPage         = lazy(() => import("@/pages/HealthPage"));
+const ProtocolsPage      = lazy(() => import("@/pages/ProtocolsPage"));
+const ProtocolDetailPage = lazy(() => import("@/pages/ProtocolDetailPage"));
 
 function PageLoader() {
   return (
@@ -23,10 +25,12 @@ export default function App() {
     <Layout>
       <Suspense fallback={<PageLoader />}>
         <Switch>
-          <Route path="/"              component={DashboardPage} />
-          <Route path="/projects"      component={ProjectsPage} />
-          <Route path="/projects/:id"  component={ProjectDetailPage} />
-          <Route path="/health"        component={HealthPage} />
+          <Route path="/"                  component={DashboardPage} />
+          <Route path="/projects"          component={ProjectsPage} />
+          <Route path="/projects/:id"      component={ProjectDetailPage} />
+          <Route path="/health"            component={HealthPage} />
+          <Route path="/protocols"         component={ProtocolsPage} />
+          <Route path="/protocols/:id"     component={ProtocolDetailPage} />
           <Route>
             <div className="flex items-center justify-center min-h-[60vh]">
               <div className="text-center space-y-2">
