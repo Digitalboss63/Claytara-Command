@@ -236,11 +236,10 @@ app.post("/api/projects/:id/notes", async (req, res) => {
   }
 });
 
-// ── One-time seed endpoint ────────────────────────────────────────────────────
-// POST /api/admin/seed — seeds 6 projects + notes. Safe to call multiple times
-// (clears and re-seeds). Remove this route after first use.
+// ── Seed endpoint removed after first use ────────────────────────────────────
+// Was: POST /api/admin/seed — data is now live in DB.
 
-app.post("/api/admin/seed", async (_req, res) => {
+if (false) app.post("/api/admin/seed", async (_req, res) => {
   try {
     await db.delete(projectNotes);
     await db.delete(systemHealthSnapshots);
