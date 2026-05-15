@@ -17,7 +17,7 @@
 import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
-import { eq, desc } from "drizzle-orm";
+import { eq, desc, sql as drizzleSql } from "drizzle-orm";
 import { resolve } from "path";
 import { fileURLToPath } from "url";
 import db from "./db/index.js";
@@ -84,7 +84,7 @@ function envOk(): boolean {
 app.get("/api/health/full", async (_req, res) => {
   let dbOk = false;
   try {
-    await db.execute({ sql: "SELECT 1", params: [] } as never);
+    await db.execute(drizzleSql`SELECT 1`);
     dbOk = true;
   } catch { /* db down */ }
 
