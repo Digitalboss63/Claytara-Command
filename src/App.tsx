@@ -8,6 +8,7 @@ const ProjectDetailPage  = lazy(() => import("@/pages/ProjectDetailPage"));
 const HealthPage         = lazy(() => import("@/pages/HealthPage"));
 const ProtocolsPage      = lazy(() => import("@/pages/ProtocolsPage"));
 const ProtocolDetailPage = lazy(() => import("@/pages/ProtocolDetailPage"));
+const IntelligencePage   = lazy(() => import("@/pages/IntelligencePage"));
 
 function PageLoader() {
   return (
@@ -31,6 +32,7 @@ export default function App() {
           <Route path="/health"            component={HealthPage} />
           <Route path="/protocols"         component={ProtocolsPage} />
           <Route path="/protocols/:id"     component={ProtocolDetailPage} />
+          <Route path="/intelligence"      component={IntelligencePage} />
           <Route>
             <div className="flex items-center justify-center min-h-[60vh]">
               <div className="text-center space-y-2">

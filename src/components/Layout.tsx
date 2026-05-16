@@ -1,14 +1,15 @@
 import { Link, useLocation } from "wouter";
 import {
-  LayoutDashboard, FolderKanban, Activity, Zap, ChevronRight, BookOpen,
+  LayoutDashboard, FolderKanban, Activity, Zap, ChevronRight, BookOpen, ShieldCheck,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 const NAV = [
-  { href: "/",          label: "Dashboard",  icon: LayoutDashboard },
-  { href: "/projects",  label: "Projects",   icon: FolderKanban },
-  { href: "/health",    label: "Health",     icon: Activity },
-  { href: "/protocols", label: "Protocols",  icon: BookOpen },
+  { href: "/",              label: "Dashboard",    icon: LayoutDashboard },
+  { href: "/projects",      label: "Projects",     icon: FolderKanban },
+  { href: "/health",        label: "Health",       icon: Activity },
+  { href: "/intelligence",  label: "Intelligence", icon: ShieldCheck },
+  { href: "/protocols",     label: "Protocols",    icon: BookOpen },
 ];
 
 function NavItem({ href, label, Icon }: { href: string; label: string; Icon: typeof LayoutDashboard }) {
@@ -59,7 +60,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
 
         {/* Version */}
         <div className="px-5 py-4 border-t border-border">
-          <p className="text-[10px] text-muted-foreground">Mission Control v0.1</p>
+          <p className="text-[10px] text-muted-foreground">Mission Control v0.3</p>
         </div>
       </aside>
 

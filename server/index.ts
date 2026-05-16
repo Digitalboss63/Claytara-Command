@@ -23,6 +23,7 @@ import db from "./db/index.js";
 import { runMigrations } from "./db/migrate.js";
 import {
   projects, projectNotes, systemHealthSnapshots, protocols,
+  detectionRules, readinessSnapshots, activityLog, detectionAuditLog,
   insertProjectSchema, insertNoteSchema, insertProtocolSchema,
 } from "../shared/schema.js";
 
@@ -185,7 +186,8 @@ app.post("/api/projects", async (req, res) => {
   const parsed = insertProjectSchema.safeParse(req.body);
   if (!parsed.success) { res.status(400).json({ error: "Invalid project data", issues: parsed.error.issues }); return; }
   try {
-    const [created] = await db.insert(projects).values(parsed.data).returning();
+    const insertData = { ...parsed.data, lastDeployedAt: parsed.data.lastDeployedAt ? new Date(parsed.data.lastDeployedAt) : null };
+    const [created] = await db.insert(projects).values(insertData as any).returning();
     res.status(201).json({ project: created });
   } catch (err) {
     res.status(500).json({ error: "Failed to create project" });
@@ -200,8 +202,10 @@ app.put("/api/projects/:id", async (req, res) => {
   const parsed = insertProjectSchema.partial().safeParse(req.body);
   if (!parsed.success) { res.status(400).json({ error: "Invalid project data", issues: parsed.error.issues }); return; }
   try {
-    const [updated] = await db.update(projects).set({ ...parsed.data, updatedAt: new Date() }).where(eq(projects.id, id)).returning();
+    const updateData = { ...parsed.data, lastDeployedAt: parsed.data.lastDeployedAt !== undefined ? (parsed.data.lastDeployedAt ? new Date(parsed.data.lastDeployedAt) : null) : undefined, updatedAt: new Date() };
+    const [updated] = await db.update(projects).set(updateData as any).where(eq(projects.id, id)).returning();
     if (!updated) { res.status(404).json({ error: "Project not found" }); return; }
+    await logActivity({ projectId: id, eventType: "project_updated", severity: "info", title: `Project updated: ${updated.name}` });
     res.json({ project: updated });
   } catch (err) {
     res.status(500).json({ error: "Failed to update project" });
@@ -228,6 +232,13 @@ app.get("/api/projects/:id/check-health", async (req, res) => {
       lastHealthError: result.error,
       updatedAt: new Date(),
     }).where(eq(projects.id, id));
+    await logActivity({
+      projectId: project.id,
+      eventType: result.status === "healthy" ? "health_check_passed" : "health_check_failed",
+      severity: result.status === "critical" ? "critical" : result.status === "warning" ? "warning" : "info",
+      title: `Health check ${result.status}: ${project.name}`,
+      description: result.summary?.slice(0, 200) ?? undefined,
+    });
     process.stdout.write(`[health-check] project=${id} status=${result.status} ms=${result.responseMs}\n`);
     res.json({ ...result, checkedAt: new Date().toISOString() });
   } catch (err) {
@@ -346,10 +357,389 @@ app.put("/api/protocols/:id", async (req, res) => {
   try {
     const [updated] = await db.update(protocols).set({ ...parsed.data, updatedAt: new Date() }).where(eq(protocols.id, id)).returning();
     if (!updated) { res.status(404).json({ error: "Protocol not found" }); return; }
+    await logActivity({ eventType: "protocol_updated", severity: "info", title: `Protocol updated: ${updated.title}` });
     res.json({ protocol: updated });
   } catch (err) {
     res.status(500).json({ error: "Failed to update protocol" });
     process.stderr.write(`[protocols] update error: ${safeError(err)}\n`);
+  }
+});
+
+// ── Phase 3: Activity logging helper ─────────────────────────────────────────
+async function logActivity(opts: {
+  projectId?: number | null;
+  eventType: string;
+  severity?: string;
+  title: string;
+  description?: string;
+}): Promise<void> {
+  try {
+    await db.insert(activityLog).values({
+      projectId: opts.projectId ?? null,
+      eventType: opts.eventType as "health_check_passed" | "health_check_failed" | "project_updated" | "protocol_updated" | "blocker_added" | "blocker_resolved" | "readiness_changed" | "issue_detected" | "issue_resolved",
+      severity: (opts.severity ?? "info") as "info" | "warning" | "critical",
+      title: opts.title,
+      description: opts.description ?? null,
+    });
+  } catch { /* never crash on activity log failures */ }
+}
+
+// ── Phase 3: Readiness scoring ────────────────────────────────────────────────
+function calculateReadiness(project: typeof projects.$inferSelect): {
+  infrastructure: number;
+  deployment: number;
+  ai: number;
+  operational: number;
+  monitoring: number;
+  overall: number;
+} {
+  // Infrastructure (0-100): +25 each for: githubUrl, railwayUrl, domain, healthEndpointUrl
+  let infrastructure = 0;
+  if (project.githubUrl)         infrastructure += 25;
+  if (project.railwayUrl)        infrastructure += 25;
+  if (project.domain)            infrastructure += 25;
+  if (project.healthEndpointUrl) infrastructure += 25;
+
+  // Deployment (0-100)
+  const stageScore: Record<string, number> = { idea: 20, prototype: 40, beta: 65, live: 90, scaling: 100 };
+  let deployment = stageScore[project.productionStage] ?? 20;
+  if ((project.productionStage === "live" || project.productionStage === "scaling") && !project.lastDeployedAt) {
+    deployment -= 20;
+  }
+  if (project.lastDeployedAt) {
+    const daysSinceDeployment = (Date.now() - new Date(project.lastDeployedAt).getTime()) / (24 * 60 * 60 * 1000);
+    if (daysSinceDeployment > 90) deployment -= 15;
+  }
+  deployment = Math.max(0, Math.min(100, deployment));
+
+  // AI (0-100)
+  let ai = 0;
+  if (project.aiEnabled)        ai += 60;
+  if (project.stripeConnected)  ai += 20;
+  if (project.clerkConnected)   ai += 20;
+  ai = Math.max(0, Math.min(100, ai));
+
+  // Operational (0-100): start=50, +30 nextAction, +10 notes, -40 blockers
+  let operational = 50;
+  if (project.nextAction) operational += 30;
+  if (project.notes)      operational += 10;
+  if (project.blockers)   operational -= 40;
+  operational = Math.max(0, Math.min(100, operational));
+
+  // Monitoring (0-100)
+  let monitoring = 0;
+  if (project.healthEndpointUrl) monitoring += 40;
+  const hs = project.lastHealthStatus;
+  if (hs === "healthy")       monitoring += 40;
+  else if (hs === "warning")  monitoring += 20;
+  else if (hs === "critical") monitoring -= 10;
+  if (project.lastHealthCheckedAt) {
+    const hoursAgo = (Date.now() - new Date(project.lastHealthCheckedAt).getTime()) / (60 * 60 * 1000);
+    if (hoursAgo < 24)  monitoring += 20;
+    else if (hoursAgo > 72) monitoring -= 10;
+  }
+  monitoring = Math.max(0, Math.min(100, monitoring));
+
+  const overall = Math.round((infrastructure + deployment + ai + operational + monitoring) / 5);
+
+  return { infrastructure, deployment, ai, operational, monitoring, overall };
+}
+
+// ── Phase 3: Save readiness snapshot ─────────────────────────────────────────
+async function saveReadinessSnapshot(project: typeof projects.$inferSelect): Promise<void> {
+  const scores = calculateReadiness(project);
+  await db.insert(readinessSnapshots).values({
+    projectId:           project.id,
+    infrastructureScore: scores.infrastructure,
+    deploymentScore:     scores.deployment,
+    aiScore:             scores.ai,
+    operationalScore:    scores.operational,
+    monitoringScore:     scores.monitoring,
+    overallScore:        scores.overall,
+  });
+}
+
+// ── Phase 3: Detection engine ─────────────────────────────────────────────────
+async function runDetectionEngine(): Promise<{
+  projectsChecked: number;
+  rulesChecked: number;
+  issuesFound: number;
+  issuesNew: number;
+}> {
+  const allProjects = await db.select().from(projects);
+  const activeRules = await db.select().from(detectionRules).where(eq(detectionRules.active, true));
+  const protocolRows = await db.select().from(protocols).where(eq(protocols.active, true));
+  const protocolCount = protocolRows.length;
+
+  let issuesFound = 0;
+  let issuesNew = 0;
+
+  for (const project of allProjects) {
+    for (const rule of activeRules) {
+      let config: Record<string, string> = {};
+      try { if (rule.ruleConfig) config = JSON.parse(rule.ruleConfig); } catch { /* ignore */ }
+      const key = config.key ?? "";
+
+      let violated = false;
+      switch (key) {
+        case "missing_health_endpoint":
+          violated = !project.healthEndpointUrl;
+          break;
+        case "failed_health_check":
+          violated = project.lastHealthStatus === "critical";
+          break;
+        case "missing_github_url":
+          violated = !project.githubUrl;
+          break;
+        case "missing_railway_url":
+          violated = !project.railwayUrl && (project.productionStage === "live" || project.productionStage === "scaling");
+          break;
+        case "missing_domain":
+          violated = !project.domain && (project.productionStage === "beta" || project.productionStage === "live" || project.productionStage === "scaling");
+          break;
+        case "ai_disabled":
+          violated = !project.aiEnabled;
+          break;
+        case "stale_deployment":
+          violated = (project.productionStage === "live" || project.productionStage === "scaling") &&
+            (!project.lastDeployedAt || (Date.now() - new Date(project.lastDeployedAt).getTime()) > 30 * 24 * 60 * 60 * 1000);
+          break;
+        case "missing_next_action":
+          violated = !project.nextAction;
+          break;
+        case "repeated_critical_failures":
+          violated = project.lastHealthStatus === "critical" && !!project.lastHealthError;
+          break;
+        case "missing_protocol_coverage":
+          violated = protocolCount === 0;
+          break;
+        default:
+          violated = false;
+      }
+
+      if (!violated) continue;
+      issuesFound++;
+
+      // Check for existing unresolved issue for this project + rule combo
+      const existing = await db.select().from(detectionAuditLog).where(
+        drizzleSql`${detectionAuditLog.projectId} = ${project.id}
+          AND ${detectionAuditLog.detectionRuleId} = ${rule.id}
+          AND ${detectionAuditLog.resolved} = false`
+      ).limit(1);
+
+      if (existing.length === 0) {
+        const issueTitle = rule.title;
+        const issueDescription = `${rule.description ?? rule.title} — detected for project "${project.name}"`;
+        await db.insert(detectionAuditLog).values({
+          projectId:        project.id,
+          detectionRuleId:  rule.id,
+          severity:         rule.severity,
+          issueTitle,
+          issueDescription,
+          resolved:         false,
+        });
+        await logActivity({
+          projectId:   project.id,
+          eventType:   "issue_detected",
+          severity:    rule.severity,
+          title:       `Issue detected: ${issueTitle}`,
+          description: issueDescription.slice(0, 200),
+        });
+        issuesNew++;
+      }
+    }
+  }
+
+  return {
+    projectsChecked: allProjects.length,
+    rulesChecked:    activeRules.length,
+    issuesFound,
+    issuesNew,
+  };
+}
+
+// ── Phase 3: Routes ───────────────────────────────────────────────────────────
+
+// GET /api/detection-rules
+app.get("/api/detection-rules", async (_req, res) => {
+  try {
+    const rules = await db.select().from(detectionRules).orderBy(
+      drizzleSql`CASE severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END`,
+      detectionRules.title,
+    );
+    res.json({ rules });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to load detection rules" });
+    process.stderr.write(`[detection-rules] list error: ${safeError(err)}\n`);
+  }
+});
+
+// GET /api/issues
+app.get("/api/issues", async (req, res) => {
+  try {
+    const resolvedParam = req.query.resolved as string | undefined;
+    let resolvedFilter = "";
+    if (resolvedParam === "true")  resolvedFilter = "AND dal.resolved = true";
+    else if (resolvedParam !== "all") resolvedFilter = "AND dal.resolved = false";
+
+    const rows = await db.execute(drizzleSql.raw(`
+      SELECT
+        dal.id,
+        dal.project_id       AS "projectId",
+        p.name               AS "projectName",
+        dal.detection_rule_id AS "detectionRuleId",
+        dal.severity,
+        dal.issue_title      AS "issueTitle",
+        dal.issue_description AS "issueDescription",
+        dal.resolved,
+        dal.resolution_notes AS "resolutionNotes",
+        dal.detected_at      AS "detectedAt",
+        dal.resolved_at      AS "resolvedAt"
+      FROM detection_audit_log dal
+      LEFT JOIN projects p ON p.id = dal.project_id
+      WHERE 1=1 ${resolvedFilter}
+      ORDER BY
+        CASE dal.severity WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
+        dal.detected_at DESC
+      LIMIT 100
+    `));
+    res.json({ issues: Array.from(rows) });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to load issues" });
+    process.stderr.write(`[issues] list error: ${safeError(err)}\n`);
+  }
+});
+
+// GET /api/activity
+app.get("/api/activity", async (req, res) => {
+  try {
+    const limitParam = parseInt(String(req.query.limit ?? "50"), 10);
+    const limit = Math.min(isNaN(limitParam) ? 50 : limitParam, 200);
+    const rows = await db.execute(drizzleSql.raw(`
+      SELECT
+        al.id,
+        al.project_id  AS "projectId",
+        p.name         AS "projectName",
+        al.event_type  AS "eventType",
+        al.severity,
+        al.title,
+        al.description,
+        al.created_at  AS "createdAt"
+      FROM activity_log al
+      LEFT JOIN projects p ON p.id = al.project_id
+      ORDER BY al.created_at DESC
+      LIMIT ${limit}
+    `));
+    res.json({ activity: Array.from(rows) });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to load activity" });
+    process.stderr.write(`[activity] list error: ${safeError(err)}\n`);
+  }
+});
+
+// GET /api/readiness
+app.get("/api/readiness", async (_req, res) => {
+  try {
+    const rows = await db.execute(drizzleSql.raw(`
+      SELECT DISTINCT ON (rs.project_id)
+        rs.id,
+        rs.project_id          AS "projectId",
+        p.name                 AS "projectName",
+        rs.infrastructure_score AS "infrastructureScore",
+        rs.deployment_score    AS "deploymentScore",
+        rs.ai_score            AS "aiScore",
+        rs.operational_score   AS "operationalScore",
+        rs.monitoring_score    AS "monitoringScore",
+        rs.overall_score       AS "overallScore",
+        rs.created_at          AS "createdAt"
+      FROM readiness_snapshots rs
+      JOIN projects p ON p.id = rs.project_id
+      ORDER BY rs.project_id, rs.created_at DESC
+    `));
+    // Re-sort by overall_score asc after DISTINCT ON
+    const sorted = Array.from(rows).sort((a: any, b: any) => (a.overallScore ?? 0) - (b.overallScore ?? 0));
+    res.json({ readiness: sorted });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to load readiness" });
+    process.stderr.write(`[readiness] list error: ${safeError(err)}\n`);
+  }
+});
+
+// GET /api/readiness/:projectId
+app.get("/api/readiness/:projectId", async (req, res) => {
+  const projectId = parseInt(req.params.projectId, 10);
+  if (isNaN(projectId)) { res.status(400).json({ error: "Invalid project ID" }); return; }
+  try {
+    const rows = await db.execute(drizzleSql.raw(`
+      SELECT
+        rs.id,
+        rs.project_id          AS "projectId",
+        p.name                 AS "projectName",
+        rs.infrastructure_score AS "infrastructureScore",
+        rs.deployment_score    AS "deploymentScore",
+        rs.ai_score            AS "aiScore",
+        rs.operational_score   AS "operationalScore",
+        rs.monitoring_score    AS "monitoringScore",
+        rs.overall_score       AS "overallScore",
+        rs.created_at          AS "createdAt"
+      FROM readiness_snapshots rs
+      JOIN projects p ON p.id = rs.project_id
+      WHERE rs.project_id = ${projectId}
+      ORDER BY rs.created_at DESC
+      LIMIT 1
+    `));
+    res.json({ readiness: Array.from(rows)[0] ?? null });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to load readiness" });
+    process.stderr.write(`[readiness] project error: ${safeError(err)}\n`);
+  }
+});
+
+// POST /api/intelligence/run
+app.post("/api/intelligence/run", async (_req, res) => {
+  try {
+    const detectionResult = await runDetectionEngine();
+    const allProjects = await db.select().from(projects);
+    for (const project of allProjects) {
+      await saveReadinessSnapshot(project).catch(e =>
+        process.stderr.write(`[readiness] snapshot error project=${project.id}: ${safeError(e)}\n`)
+      );
+    }
+    process.stdout.write(`[intelligence] Detection run complete: ${JSON.stringify(detectionResult)}\n`);
+    res.json(detectionResult);
+  } catch (err) {
+    res.status(500).json({ error: "Intelligence run failed" });
+    process.stderr.write(`[intelligence] run error: ${safeError(err)}\n`);
+  }
+});
+
+// POST /api/issues/:id/resolve
+app.post("/api/issues/:id/resolve", async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (isNaN(id)) { res.status(400).json({ error: "Invalid issue ID" }); return; }
+  const { resolutionNotes } = req.body as { resolutionNotes?: string };
+  try {
+    const [existing] = await db.select().from(detectionAuditLog).where(eq(detectionAuditLog.id, id));
+    if (!existing) { res.status(404).json({ error: "Issue not found" }); return; }
+    const [updated] = await db.update(detectionAuditLog)
+      .set({
+        resolved:        true,
+        resolvedAt:      new Date(),
+        resolutionNotes: resolutionNotes ?? null,
+      })
+      .where(eq(detectionAuditLog.id, id))
+      .returning();
+    await logActivity({
+      projectId: existing.projectId ?? null,
+      eventType: "issue_resolved",
+      severity:  "info",
+      title:     `Issue resolved: ${existing.issueTitle}`,
+      description: resolutionNotes?.slice(0, 200) ?? undefined,
+    });
+    res.json({ issue: updated });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to resolve issue" });
+    process.stderr.write(`[issues] resolve error: ${safeError(err)}\n`);
   }
 });
 
@@ -371,6 +761,27 @@ app.use((err: Error, _req: express.Request, res: express.Response, _next: expres
   process.stderr.write(`[error] ${safeError(err)}\n`);
   res.status(500).json({ error: "Internal server error" });
 });
+
+// ── Detection Rules seeder — runs once if table is empty ─────────────────────
+async function seedDetectionRulesIfEmpty(): Promise<void> {
+  const existing = await db.select().from(detectionRules).limit(1);
+  if (existing.length > 0) return;
+
+  process.stdout.write("[detection-rules] Seeding default detection rules...\n");
+  await db.insert(detectionRules).values([
+    { title: "Missing Health Endpoint",       description: "Project has no health check URL configured.",                      severity: "warning",  active: true, ruleType: "missing_field", ruleConfig: JSON.stringify({ key: "missing_health_endpoint" }) },
+    { title: "Critical Health Check Failure", description: "Project health endpoint is returning a critical status.",           severity: "critical", active: true, ruleType: "health_check",  ruleConfig: JSON.stringify({ key: "failed_health_check" }) },
+    { title: "Missing GitHub URL",            description: "Project has no GitHub repository URL configured.",                  severity: "warning",  active: true, ruleType: "missing_field", ruleConfig: JSON.stringify({ key: "missing_github_url" }) },
+    { title: "Missing Railway URL",           description: "Live/scaling project has no Railway deployment URL.",               severity: "warning",  active: true, ruleType: "missing_field", ruleConfig: JSON.stringify({ key: "missing_railway_url" }) },
+    { title: "Missing Domain",                description: "Beta/live/scaling project has no domain configured.",               severity: "warning",  active: true, ruleType: "missing_field", ruleConfig: JSON.stringify({ key: "missing_domain" }) },
+    { title: "AI Not Enabled",                description: "Project does not have AI features enabled.",                        severity: "info",     active: true, ruleType: "missing_field", ruleConfig: JSON.stringify({ key: "ai_disabled" }) },
+    { title: "Stale Deployment",              description: "Live/scaling project has not been deployed in over 30 days.",       severity: "warning",  active: true, ruleType: "staleness",     ruleConfig: JSON.stringify({ key: "stale_deployment" }) },
+    { title: "No Next Action Defined",        description: "Project has no next action defined.",                               severity: "info",     active: true, ruleType: "missing_field", ruleConfig: JSON.stringify({ key: "missing_next_action" }) },
+    { title: "Repeated Critical Failures",    description: "Project is in critical health status with an active error logged.", severity: "critical", active: true, ruleType: "health_check",  ruleConfig: JSON.stringify({ key: "repeated_critical_failures" }) },
+    { title: "No Protocol Coverage",          description: "No active protocols defined — team has no documented standards.",   severity: "warning",  active: true, ruleType: "coverage",      ruleConfig: JSON.stringify({ key: "missing_protocol_coverage" }) },
+  ]);
+  process.stdout.write("[detection-rules] 10 rules seeded.\n");
+}
 
 // ── Protocol seeder — runs once if protocols table is empty ───────────────────
 async function seedProtocolsIfEmpty(): Promise<void> {
@@ -614,6 +1025,31 @@ async function start() {
     await seedProtocolsIfEmpty();
   } catch (e) {
     process.stderr.write(`[protocols] Seed failed: ${safeError(e)}\n`);
+  }
+
+  try {
+    await seedDetectionRulesIfEmpty();
+  } catch (e) {
+    process.stderr.write(`[detection-rules] Seed failed: ${safeError(e)}\n`);
+  }
+
+  try {
+    const detectionResult = await runDetectionEngine();
+    process.stdout.write(`[intelligence] Startup detection: ${JSON.stringify(detectionResult)}\n`);
+  } catch (e) {
+    process.stderr.write(`[intelligence] Startup detection failed: ${safeError(e)}\n`);
+  }
+
+  try {
+    const allProjects = await db.select().from(projects);
+    for (const project of allProjects) {
+      await saveReadinessSnapshot(project).catch(e =>
+        process.stderr.write(`[readiness] startup snapshot error project=${project.id}: ${safeError(e)}\n`)
+      );
+    }
+    process.stdout.write("[readiness] Startup snapshots saved.\n");
+  } catch (e) {
+    process.stderr.write(`[readiness] Startup snapshots failed: ${safeError(e)}\n`);
   }
 
   app.listen(PORT, "0.0.0.0", () => {

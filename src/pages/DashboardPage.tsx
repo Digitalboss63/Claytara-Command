@@ -3,7 +3,7 @@
  * Shows: system health cards, project status summary, recent activity
  */
 
-import { Activity, FolderKanban, AlertTriangle, CheckCircle2, TrendingUp, Zap } from "lucide-react";
+import { Activity, FolderKanban, AlertTriangle, CheckCircle2, TrendingUp, ShieldCheck } from "lucide-react";
 import { Link } from "wouter";
 import { PageHeader } from "@/components/Layout";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -12,6 +12,7 @@ import { StatusDot } from "@/components/StatusDot";
 import { Badge } from "@/components/ui/badge";
 import { useHealth, useServices } from "@/hooks/useHealth";
 import { useProjects } from "@/hooks/useProjects";
+import { useIssues } from "@/hooks/useIntelligence";
 import { cn, statusBg, priorityColor, formatRelative } from "@/lib/utils";
 
 const DEFAULT_SERVICES = [
@@ -49,6 +50,7 @@ export default function DashboardPage() {
   const { data: health } = useHealth();
   const { data: services } = useServices();
   const { data: projects, isLoading: loadingProjects } = useProjects();
+  const { data: issuesData } = useIssues(false);
 
   const activeProjects  = projects?.filter(p => p.status === "active").length ?? 0;
   const buildingProjects = projects?.filter(p => p.status === "building").length ?? 0;
@@ -154,30 +156,79 @@ export default function DashboardPage() {
           </Card>
         </section>
 
-        {/* ── AI Readiness block ────────────────────────────────────────────── */}
+        {/* ── Operational Intelligence block ────────────────────────────────── */}
         <section>
-          <h2 className="text-base font-semibold text-foreground flex items-center gap-2 mb-4">
-            <Zap className="h-4 w-4 text-muted-foreground" />
-            AI Readiness Layer
-          </h2>
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
-            {[
-              { label: "AI Agents",       status: "Phase 2",  desc: "Multi-agent orchestration" },
-              { label: "Retrieval System", status: "Phase 2", desc: "Catalog-grounded answers" },
-              { label: "Self-Heal",        status: "Phase 2", desc: "Auto-detection + repair" },
-              { label: "Protocol Engine",  status: "Phase 2", desc: "Claytara build protocols" },
-            ].map(({ label, status, desc }) => (
-              <Card key={label} className="opacity-60 cursor-not-allowed">
-                <CardContent className="pt-4 pb-4">
-                  <p className="text-sm font-medium text-foreground mb-0.5">{label}</p>
-                  <p className="text-xs text-muted-foreground mb-2">{desc}</p>
-                  <Badge className="text-[10px] bg-muted text-muted-foreground border border-border">
-                    {status}
-                  </Badge>
-                </CardContent>
-              </Card>
-            ))}
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-base font-semibold text-foreground flex items-center gap-2">
+              <ShieldCheck className="h-4 w-4 text-muted-foreground" />
+              Operational Intelligence
+            </h2>
+            <Link href="/intelligence">
+              <span className="text-xs text-primary hover:text-primary/80 cursor-pointer transition-colors">
+                View All Issues →
+              </span>
+            </Link>
           </div>
+          {(() => {
+            const issues = issuesData?.issues ?? [];
+            const criticalIssues = issues.filter(i => i.severity === "critical");
+
+            // Group by project
+            const projectMap = new Map<number, { projectId: number; projectName: string; worstSeverity: string; count: number }>();
+            for (const issue of issues) {
+              if (!issue.projectId) continue;
+              if (issue.severity !== "critical" && issue.severity !== "warning") continue;
+              const existing = projectMap.get(issue.projectId);
+              if (!existing) {
+                projectMap.set(issue.projectId, { projectId: issue.projectId, projectName: issue.projectName ?? `Project ${issue.projectId}`, worstSeverity: issue.severity, count: 1 });
+              } else {
+                existing.count++;
+                if (issue.severity === "critical") existing.worstSeverity = "critical";
+              }
+            }
+            const attentionProjects = [...projectMap.values()]
+              .sort((a, b) => a.worstSeverity === "critical" ? -1 : b.worstSeverity === "critical" ? 1 : 0)
+              .slice(0, 3);
+
+            return (
+              <div className="space-y-3">
+                {criticalIssues.length > 0 && (
+                  <Card className="border-red-400/30 bg-red-400/5">
+                    <CardContent className="py-3 px-5 flex items-center gap-3">
+                      <AlertTriangle className="h-4 w-4 text-red-400 shrink-0" />
+                      <p className="text-sm text-red-400 font-medium">
+                        {criticalIssues.length} critical issue{criticalIssues.length !== 1 ? "s" : ""} detected — immediate attention required.
+                      </p>
+                    </CardContent>
+                  </Card>
+                )}
+                {attentionProjects.length === 0 ? (
+                  <Card>
+                    <CardContent className="py-5 flex items-center gap-3 text-green-400">
+                      <CheckCircle2 className="h-4 w-4 shrink-0" />
+                      <p className="text-sm font-medium">All systems nominal — no critical or warning issues.</p>
+                    </CardContent>
+                  </Card>
+                ) : (
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    {attentionProjects.map(proj => (
+                      <Card key={proj.projectId} className={cn("border", proj.worstSeverity === "critical" ? "border-red-400/30" : "border-amber-400/20")}>
+                        <CardContent className="pt-3 pb-3 px-4">
+                          <div className="flex items-center justify-between gap-2">
+                            <p className="text-sm font-medium text-foreground truncate">{proj.projectName}</p>
+                            <Badge className={cn("text-[10px] border capitalize shrink-0", proj.worstSeverity === "critical" ? "bg-red-400/10 text-red-400 border-red-400/20" : "bg-amber-400/10 text-amber-400 border-amber-400/20")}>
+                              {proj.worstSeverity}
+                            </Badge>
+                          </div>
+                          <p className="text-xs text-muted-foreground mt-0.5">{proj.count} issue{proj.count !== 1 ? "s" : ""}</p>
+                        </CardContent>
+                      </Card>
+                    ))}
+                  </div>
+                )}
+              </div>
+            );
+          })()}
         </section>
 
       </div>

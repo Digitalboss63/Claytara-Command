@@ -137,6 +137,111 @@ export const insertProtocolSchema = z.object({
   active:       z.boolean().default(true),
 });
 
+// ── Phase 3 Enums ─────────────────────────────────────────────────────────────
+
+export const severityLevelEnum = pgEnum("severity_level", [
+  "info", "warning", "critical",
+]);
+
+export const ruleTypeEnum = pgEnum("rule_type", [
+  "missing_field", "health_check", "staleness", "threshold", "coverage",
+]);
+
+export const activityEventTypeEnum = pgEnum("activity_event_type", [
+  "health_check_passed", "health_check_failed", "project_updated",
+  "protocol_updated", "blocker_added", "blocker_resolved",
+  "readiness_changed", "issue_detected", "issue_resolved",
+]);
+
+// ── Phase 3 Tables ────────────────────────────────────────────────────────────
+
+export const detectionRules = pgTable("detection_rules", {
+  id:          serial("id").primaryKey(),
+  title:       text("title").notNull(),
+  description: text("description"),
+  severity:    severityLevelEnum("severity").notNull().default("warning"),
+  active:      boolean("active").notNull().default(true),
+  ruleType:    ruleTypeEnum("rule_type").notNull().default("missing_field"),
+  ruleConfig:  text("rule_config"),
+  createdAt:   timestamp("created_at").notNull().defaultNow(),
+  updatedAt:   timestamp("updated_at").notNull().defaultNow(),
+});
+
+export const readinessSnapshots = pgTable("readiness_snapshots", {
+  id:                 serial("id").primaryKey(),
+  projectId:          integer("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),
+  infrastructureScore: integer("infrastructure_score").notNull().default(0),
+  deploymentScore:    integer("deployment_score").notNull().default(0),
+  aiScore:            integer("ai_score").notNull().default(0),
+  operationalScore:   integer("operational_score").notNull().default(0),
+  monitoringScore:    integer("monitoring_score").notNull().default(0),
+  overallScore:       integer("overall_score").notNull().default(0),
+  createdAt:          timestamp("created_at").notNull().defaultNow(),
+});
+
+export const activityLog = pgTable("activity_log", {
+  id:          serial("id").primaryKey(),
+  projectId:   integer("project_id").references(() => projects.id, { onDelete: "set null" }),
+  eventType:   activityEventTypeEnum("event_type").notNull(),
+  severity:    severityLevelEnum("severity").notNull().default("info"),
+  title:       text("title").notNull(),
+  description: text("description"),
+  createdAt:   timestamp("created_at").notNull().defaultNow(),
+});
+
+export const detectionAuditLog = pgTable("detection_audit_log", {
+  id:                serial("id").primaryKey(),
+  projectId:         integer("project_id").references(() => projects.id, { onDelete: "set null" }),
+  detectionRuleId:   integer("detection_rule_id").references(() => detectionRules.id, { onDelete: "set null" }),
+  severity:          severityLevelEnum("severity").notNull().default("warning"),
+  issueTitle:        text("issue_title").notNull(),
+  issueDescription:  text("issue_description"),
+  resolved:          boolean("resolved").notNull().default(false),
+  resolutionNotes:   text("resolution_notes"),
+  detectedAt:        timestamp("detected_at").notNull().defaultNow(),
+  resolvedAt:        timestamp("resolved_at"),
+});
+
+// ── Phase 3 Zod schemas ───────────────────────────────────────────────────────
+
+export const insertDetectionRuleSchema = z.object({
+  title:       z.string().min(1).max(200),
+  description: z.string().max(500).optional().nullable(),
+  severity:    z.enum(["info", "warning", "critical"]).default("warning"),
+  active:      z.boolean().default(true),
+  ruleType:    z.enum(["missing_field", "health_check", "staleness", "threshold", "coverage"]).default("missing_field"),
+  ruleConfig:  z.string().optional().nullable(),
+});
+
+export const insertReadinessSnapshotSchema = z.object({
+  projectId:           z.number().int().positive(),
+  infrastructureScore: z.number().int().min(0).max(100).default(0),
+  deploymentScore:     z.number().int().min(0).max(100).default(0),
+  aiScore:             z.number().int().min(0).max(100).default(0),
+  operationalScore:    z.number().int().min(0).max(100).default(0),
+  monitoringScore:     z.number().int().min(0).max(100).default(0),
+  overallScore:        z.number().int().min(0).max(100).default(0),
+});
+
+export const insertActivityLogSchema = z.object({
+  projectId:   z.number().int().positive().optional().nullable(),
+  eventType:   z.enum(["health_check_passed","health_check_failed","project_updated","protocol_updated","blocker_added","blocker_resolved","readiness_changed","issue_detected","issue_resolved"]),
+  severity:    z.enum(["info","warning","critical"]).default("info"),
+  title:       z.string().min(1).max(300),
+  description: z.string().max(1000).optional().nullable(),
+});
+
+export const insertDetectionAuditLogSchema = z.object({
+  projectId:        z.number().int().positive().optional().nullable(),
+  detectionRuleId:  z.number().int().positive().optional().nullable(),
+  severity:         z.enum(["info","warning","critical"]).default("warning"),
+  issueTitle:       z.string().min(1).max(300),
+  issueDescription: z.string().max(1000).optional().nullable(),
+  resolved:         z.boolean().default(false),
+  resolutionNotes:  z.string().max(1000).optional().nullable(),
+  resolvedAt:       z.string().datetime().optional().nullable(),
+});
+
 // ── TypeScript types ──────────────────────────────────────────────────────────
 
 export type Project              = InferSelectModel<typeof projects>;
@@ -147,6 +252,15 @@ export type HealthSnapshot       = InferSelectModel<typeof systemHealthSnapshots
 export type InsertHealthSnapshot = InferInsertModel<typeof systemHealthSnapshots>;
 export type Protocol             = InferSelectModel<typeof protocols>;
 export type InsertProtocol       = InferInsertModel<typeof protocols>;
+
+export type DetectionRule            = InferSelectModel<typeof detectionRules>;
+export type InsertDetectionRule      = InferInsertModel<typeof detectionRules>;
+export type ReadinessSnapshot        = InferSelectModel<typeof readinessSnapshots>;
+export type InsertReadinessSnapshot  = InferInsertModel<typeof readinessSnapshots>;
+export type ActivityLogEntry         = InferSelectModel<typeof activityLog>;
+export type InsertActivityLogEntry   = InferInsertModel<typeof activityLog>;
+export type DetectionAuditLogEntry   = InferSelectModel<typeof detectionAuditLog>;
+export type InsertDetectionAuditLog  = InferInsertModel<typeof detectionAuditLog>;
 
 export type HealthStatus = "healthy" | "warning" | "critical" | "unknown";
 

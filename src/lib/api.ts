@@ -50,3 +50,75 @@ export const fetchProtocols = () => apiFetch<{ protocols: Protocol[] }>("/api/pr
 export const fetchProtocol  = (id: number) => apiFetch<{ protocol: Protocol }>(`/api/protocols/${id}`);
 export const createProtocol = (data: Partial<InsertProtocol>) => apiFetch<{ protocol: Protocol }>("/api/protocols", { method: "POST", body: JSON.stringify(data) });
 export const updateProtocol = (id: number, data: Partial<InsertProtocol>) => apiFetch<{ protocol: Protocol }>(`/api/protocols/${id}`, { method: "PUT", body: JSON.stringify(data) });
+
+// ── Intelligence ──────────────────────────────────────────────────────────────
+
+export interface DetectionRule {
+  id: number;
+  title: string;
+  description: string | null;
+  severity: string;
+  active: boolean;
+  ruleType: string;
+  ruleConfig: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface IssueEntry {
+  id: number;
+  projectId: number | null;
+  projectName?: string;
+  detectionRuleId: number | null;
+  severity: string;
+  issueTitle: string;
+  issueDescription: string | null;
+  resolved: boolean;
+  resolutionNotes: string | null;
+  detectedAt: string;
+  resolvedAt: string | null;
+}
+
+export interface ActivityEntry {
+  id: number;
+  projectId: number | null;
+  projectName?: string;
+  eventType: string;
+  severity: string;
+  title: string;
+  description: string | null;
+  createdAt: string;
+}
+
+export interface ReadinessEntry {
+  id: number;
+  projectId: number;
+  projectName?: string;
+  infrastructureScore: number;
+  deploymentScore: number;
+  aiScore: number;
+  operationalScore: number;
+  monitoringScore: number;
+  overallScore: number;
+  createdAt: string;
+}
+
+export const fetchDetectionRules = () => apiFetch<{ rules: DetectionRule[] }>("/api/detection-rules");
+export const fetchIssues = (resolved?: boolean) =>
+  apiFetch<{ issues: IssueEntry[] }>(`/api/issues${resolved !== undefined ? `?resolved=${resolved}` : ""}`);
+export const fetchActivity = (limit = 50) =>
+  apiFetch<{ activity: ActivityEntry[] }>(`/api/activity?limit=${limit}`);
+export const fetchReadiness = () =>
+  apiFetch<{ readiness: ReadinessEntry[] }>("/api/readiness");
+export const fetchProjectReadiness = (projectId: number) =>
+  apiFetch<{ readiness: ReadinessEntry | null }>(`/api/readiness/${projectId}`);
+export const resolveIssue = (id: number, resolutionNotes?: string) =>
+  apiFetch<{ issue: IssueEntry }>(`/api/issues/${id}/resolve`, {
+    method: "POST",
+    body: JSON.stringify({ resolutionNotes }),
+  });
+export const runDetection = () =>
+  apiFetch<{ projectsChecked: number; rulesChecked: number; issuesFound: number; issuesNew: number }>(
+    "/api/intelligence/run",
+    { method: "POST" }
+  );

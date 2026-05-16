@@ -7,7 +7,7 @@ import { useState } from "react";
 import { useParams, Link } from "wouter";
 import {
   ArrowLeft, Globe, Github, ExternalLink, Zap, CreditCard, Users,
-  AlertTriangle, Clock, CheckCircle2, FileText, Edit2, Activity, RefreshCw,
+  AlertTriangle, Clock, CheckCircle2, FileText, Edit2, Activity, RefreshCw, BarChart2,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -17,6 +17,7 @@ import { StatusDot } from "@/components/StatusDot";
 import { ProjectEditModal } from "@/components/ProjectEditModal";
 import { HandoffSummary } from "@/components/HandoffSummary";
 import { useProject, useCheckProjectHealth } from "@/hooks/useProjects";
+import { useProjectReadiness } from "@/hooks/useIntelligence";
 import { cn, statusBg, priorityColor, formatDate, formatRelative } from "@/lib/utils";
 import type { ProjectNote, Project } from "../../shared/schema";
 
@@ -84,6 +85,7 @@ export default function ProjectDetailPage() {
   const id = parseInt(params.id ?? "0", 10);
   const { data, isLoading, error } = useProject(id);
   const { mutate: checkHealth, isPending: checkingHealth } = useCheckProjectHealth(id);
+  const { data: readinessData } = useProjectReadiness(id);
   const [editing, setEditing] = useState(false);
 
   if (isLoading) {
@@ -219,6 +221,52 @@ export default function ProjectDetailPage() {
                         <Edit2 className="h-3 w-3" /> Add one
                       </Button>
                     </div>
+                  )}
+                </CardContent>
+              </Card>
+
+              {/* Readiness Score */}
+              <Card>
+                <CardHeader>
+                  <CardTitle className="flex items-center gap-2 text-sm">
+                    <BarChart2 className="h-4 w-4 text-muted-foreground" /> Readiness Score
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="pt-0">
+                  {readinessData?.readiness ? (
+                    <div className="space-y-3">
+                      <div className="flex items-end gap-2 mb-4">
+                        <span className={cn("text-4xl font-bold", readinessData.readiness.overallScore >= 80 ? "text-green-400" : readinessData.readiness.overallScore >= 60 ? "text-amber-400" : "text-red-400")}>
+                          {readinessData.readiness.overallScore}
+                        </span>
+                        <span className="text-muted-foreground text-sm mb-1">/100</span>
+                      </div>
+                      {([
+                        ["Infrastructure", readinessData.readiness.infrastructureScore],
+                        ["Deployment",     readinessData.readiness.deploymentScore],
+                        ["AI Systems",     readinessData.readiness.aiScore],
+                        ["Operational",    readinessData.readiness.operationalScore],
+                        ["Monitoring",     readinessData.readiness.monitoringScore],
+                      ] as [string, number][]).map(([label, score]) => (
+                        <div key={label} className="space-y-1">
+                          <div className="flex justify-between text-xs">
+                            <span className="text-muted-foreground">{label}</span>
+                            <span className={cn("font-medium", score >= 80 ? "text-green-400" : score >= 60 ? "text-amber-400" : "text-red-400")}>{score}</span>
+                          </div>
+                          <div className="h-1.5 rounded-full bg-muted">
+                            <div
+                              className={cn("h-full rounded-full transition-all", score >= 80 ? "bg-green-400" : score >= 60 ? "bg-amber-400" : "bg-red-400")}
+                              style={{ width: `${score}%` }}
+                            />
+                          </div>
+                        </div>
+                      ))}
+                      <p className="text-[10px] text-muted-foreground mt-2">
+                        Last calculated {formatRelative(readinessData.readiness.createdAt)}
+                      </p>
+                    </div>
+                  ) : (
+                    <p className="text-sm text-muted-foreground">No readiness data — run detection to calculate.</p>
                   )}
                 </CardContent>
               </Card>
